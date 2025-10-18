@@ -1,0 +1,33 @@
+[project]
+name = "DuckRunnerAnalysis"
+version = "0.1.0"
+description = "Running data analysis from FIT files."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "autopep8>=2.3.2",
+    "black>=25.9.0",
+    "commitizen>=4.9.1",
+    "flake8>=7.3.0",
+    "flake8-bugbear>=24.12.12",
+    "isort>=7.0.0",
+    "pre-commit>=4.3.0",
+    "pydocstyle>=6.3.0",
+]
+
+[tool.isort]
+profile = "black"
+
+[tool.black]
+line-length = 88
+
+[tool.pydocstyle]
+convention = "numpy"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_scheme = "pep440"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
