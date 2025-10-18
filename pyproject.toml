@@ -4,16 +4,25 @@ version = "0.1.0"
 description = "Running data analysis from FIT files."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "autopep8>=2.3.2",
-    "black>=25.9.0",
-    "commitizen>=4.9.1",
-    "flake8>=7.3.0",
-    "flake8-bugbear>=24.12.12",
-    "isort>=7.0.0",
-    "pre-commit>=4.3.0",
-    "pydocstyle>=6.3.0",
+
+[dependency-groups]
+dev = [
+  "autopep8>=2.3.2",
+  "black>=25.9.0",
+  "commitizen>=4.9.1",
+  "flake8>=7.3.0",
+  "flake8-bugbear>=24.12.12",
+  "isort>=7.0.0",
+  "pre-commit>=4.3.0",
+  "pydocstyle>=6.3.0",
 ]
+
+prd = [
+    "streamlit>=1.50.0",
+]
+
+[tool.uv]
+default-groups = ["prd"]
 
 [tool.isort]
 profile = "black"
