@@ -1,0 +1,70 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: trailing-whitespace
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+    -   id: check-toml
+    -   id: detect-private-key
+    -   id: check-added-large-files
+        args: ['--maxkb=1024']
+    - id: no-commit-to-branch
+      args: [--branch, master, --branch, main]
+
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+    -   id: mypy
+        additional_dependencies: [tokenize-rt==3.2.0]
+
+-   repo: https://github.com/psf/black
+    rev: 24.2.0
+    hooks:
+    -   id: black
+        args: ["--line-length=88"]
+
+-   repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+    -   id: isort
+
+-   repo: https://github.com/pre-commit/mirrors-autopep8
+    rev: v2.0.2
+    hooks:
+    -   id: autopep8
+        args: ["--max-line-length=88", "--in-place", "--aggressive", "--aggressive"]
+
+-   repo: https://github.com/PyCQA/pydocstyle
+    rev: 6.3.0
+    hooks:
+    -   id: pydocstyle
+
+-   repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+    -   id: flake8
+        additional_dependencies: [flake8-bugbear]
+
+# Bandit hook avoing B101 (assert statement) on tests folder
+-   repo: https://github.com/PyCQA/bandit
+    rev: 1.7.7
+    hooks:
+      - id: bandit
+        args: ["--skip", "B101"]
+        files: tests/
+# Bandit hook on the remain project folders
+-   repo: https://github.com/PyCQA/bandit
+    rev: 1.7.7
+    hooks:
+    -   id: bandit
+        exclude: tests/
+
+-   repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.15.0
+    hooks:
+    -   id: commitizen
+    -   id: commitizen-branch
+        stages: [pre-push]
