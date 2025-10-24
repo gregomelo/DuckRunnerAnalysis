@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Running data analysis from FIT files."
 readme = "README.md"
 requires-python = ">=3.12"
+dependencies = [
+    "garmin-fit-sdk>=21.178.0",
+    "plotly>=6.3.1",
+    "streamlit[charts]>=1.50.0",
+]
 
 [dependency-groups]
 dev = [
@@ -12,7 +17,9 @@ dev = [
   "commitizen>=4.9.1",
   "flake8>=7.3.0",
   "flake8-bugbear>=24.12.12",
+  "ipykernel>=7.0.1",
   "isort>=7.0.0",
+  "jupyter>=1.1.1",
   "pre-commit>=4.3.0",
   "pydocstyle>=6.3.0",
 ]
