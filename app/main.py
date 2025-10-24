@@ -96,9 +96,21 @@ st.markdown(
             padding-right: 1rem;
             padding-bottom: 1rem;
         }
-        section[data-testid="stSidebar"] {
-        min-width: 325px !important;
-        max-width: 400px !important;
+        /* Sidebar opened */
+        section[data-testid="stSidebar"][aria-expanded="true"] {
+            width: 325px !important;
+            min-width: 325px !important;
+            max-width: 400px !important;
+        }
+
+        /* Sidebar closed */
+        section[data-testid="stSidebar"][aria-expanded="false"] {
+            width: 0 !important;
+            min-width: 0 !important;
+            max-width: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
     }
     </style>
     """,
