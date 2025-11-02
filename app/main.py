@@ -80,10 +80,11 @@ After launching the app, use the sidebar to:
 
 import copy
 
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from utils.loader import fit_to_df
-from utils.zone_input import ZONE_REF, pace_minsec_to_float, zone_input_st
+from utils.loader_class import DataLoaderFromFIT
+from utils.unit_converter import pace_minsec_to_float
+from utils.zone_input import ZONE_REF, zone_input_st
 
 st.set_page_config(layout="wide")
 
@@ -91,14 +92,27 @@ st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 3.75rem;
+            padding-top: 3rem;
             padding-left: 1rem;
             padding-right: 1rem;
             padding-bottom: 1rem;
         }
-        section[data-testid="stSidebar"] {
-        min-width: 325px !important;
-        max-width: 400px !important;
+
+        /* Sidebar opened */
+        section[data-testid="stSidebar"][aria-expanded="true"] {
+            width: 325px !important;
+            min-width: 325px !important;
+            max-width: 400px !important;
+        }
+
+        /* Sidebar closed */
+        section[data-testid="stSidebar"][aria-expanded="false"] {
+            width: 0 !important;
+            min-width: 0 !important;
+            max-width: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
     }
     </style>
     """,
@@ -108,53 +122,111 @@ st.markdown(
 if "zones_current" not in st.session_state:
     st.session_state["zones_current"] = copy.deepcopy(ZONE_REF)
 
-st.sidebar.write("**🦆DuckRunner🏃‍♂️**")
+with st.sidebar:
+    st.write("**🦆DuckRunner🏃‍♂️**")
 
-st.sidebar.write("**1\\.** Configure suas zonas de treino.")
+    st.write("**1\\.** Configure suas zonas de treino.")
 
-# Creating number_input for each zone
-for zone, data in st.session_state["zones_current"].items():
-    for info, value in data.items():
-        if info in ["start", "end"]:
-            if value:
-                col1, col2 = st.sidebar.columns(2)
-                with col1:
-                    zone_input_st(zone, info, "min")
-                with col2:
-                    zone_input_st(zone, info, "s")
+    # Creating number_input for each zone
+    for zone, data in st.session_state["zones_current"].items():
+        for info, value in data.items():
+            if info in ["start", "end"]:
+                if value:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        zone_input_st(zone, info, "min")
+                    with col2:
+                        zone_input_st(zone, info, "s")
 
+    # Create file uploader winget
+    st.write("**2\\.** Carrege o arquivo FIT.")
+    fit_file = st.file_uploader(
+        "**2\\.** Carrege o arquivo FIT.",
+        accept_multiple_files=False,
+        type="fit",
+        label_visibility="collapsed",
+    )
 
-# Create file uploader winget
-st.sidebar.write("**2\\.** Carrege o arquivo FIT.")
-fit_file = st.sidebar.file_uploader(
-    "**2\\.** Carrege o arquivo FIT.",
-    accept_multiple_files=False,
-    type="fit",
-    label_visibility="collapsed",
-)
+    # Choose x axis information
+    st.write("**3\\.** Escolha a medida do eixo x.")
+    xaxis_measure = st.selectbox(
+        "Medida eixo x?",
+        ("Distância", "Tempo"),
+        label_visibility="collapsed",
+    )
 
 
 if fit_file is not None:
     with st.spinner("Preparando os dados...", show_time=True):
         # Loading data to dataframes
-        df_session, _, df_lap, df_record, df_split = fit_to_df(fit_file)
+        data_loader = DataLoaderFromFIT(fit_file)
+        data_loader = data_loader.start()
 
-        # Removing NaN and filling gaps
-        df_plot = df_record.dropna(subset=["speed_pace"]).ffill()
+        df_session = data_loader.raw_session
+        df_lap = data_loader.process_lap
+        df_record = data_loader.process_record
+        df_split = data_loader.process_lap
 
-        # Create base plot
-        fig = px.line(
-            df_plot,
-            x="elapsed_time",
-            y="speed_pace",
-            hover_data={
-                "distance": True,
-                "heart_rate": True,
-                "enhanced_altitude": True,
-                "lap": True,
-                "elapsed_time": True,
-                "speed_pace": True,
-            },
+        if xaxis_measure == "Distância":
+            xasis_series = df_record["distance_processed"]
+            xasis_series_cum_name = "cum_distance_processed"
+            xasis_unit = "m"
+        else:
+            xasis_series = df_record["elapsed_time"]
+            xasis_series_cum_name = "cum_elapsed_time"
+            xasis_unit = "s"
+
+        # Creating the plot
+        fig = go.Figure()
+
+        # Pace line
+        fig.add_trace(
+            go.Scatter(
+                x=xasis_series,
+                y=df_record["pace_processed"],
+                mode="lines",
+                name="Ritmo",
+                yaxis="y",
+                line=dict(width=1.5),
+                customdata=df_record[["pace_processed_time"]],
+                hovertemplate=("<b>%{customdata[0]}</b>min/km"),
+            )
+        )
+
+        # Enhanced altitude line
+        # Scaling altitude
+        max_enhanced_altitude = df_record["enhanced_altitude"].max()
+        max_enhanced_altitude_scale = 20
+        if max_enhanced_altitude < max_enhanced_altitude_scale:
+            coef_enhanced_altitude = 1
+        else:
+            coef_enhanced_altitude = max_enhanced_altitude_scale / max_enhanced_altitude
+
+        fig.add_trace(
+            go.Scatter(
+                x=xasis_series,
+                y=(df_record["enhanced_altitude"] * coef_enhanced_altitude),
+                mode="lines",
+                name="Altitude",
+                fill="tozeroy",
+                yaxis="y2",
+                line=dict(width=0.8),
+                opacity=0.1,
+                customdata=df_record[["enhanced_altitude"]],
+                hovertemplate=("<b>%{customdata[0]:.1f}</b>m"),
+            )
+        )
+
+        # FC line
+        fig.add_trace(
+            go.Scatter(
+                x=xasis_series,
+                y=df_record["heart_rate"],
+                mode="lines",
+                name="FC",
+                yaxis="y2",
+                hovertemplate=("<b>%{y}</b>bpm"),
+            )
         )
 
         # Adding reference zones
@@ -169,38 +241,50 @@ if fit_file is not None:
                     fig.add_hline(y=y_ref, line_color=color, layer="below")
 
         # Adding reference laps
-        start_time_laps = df_lap.iloc[:-1, :]["cum_elapsed_time"]
+        start_time_laps = df_lap.iloc[:-1, :][xasis_series_cum_name]
         for _, lap_time in start_time_laps.items():
             fig.add_vline(x=lap_time, line_color="silver", layer="below", line_width=1)
 
         # Updating hover and line width
-        fig.update_traces(
-            line=dict(width=1),
-            hovertemplate=(
-                "Tempo decorrido: <b>%{x}</b>s<br>"
-                + "Distância: <b>%{customdata[0]}</b>m<br>"
-                + "FC: <b>%{customdata[1]}</b>bpm<br>"
-                + "Altitude: <b>%{customdata[2]}</b>m<br>"
-                + "Volta: <b>%{customdata[3]}</b><extra></extra>"
-            ),
-        )
+        # fig.update_traces(
+        #     line=dict(width=1.5),
+        #     # hovertemplate=(
+        #     #     "Tempo decorrido: <b>%{x}</b>s<br>"
+        #     #     + "Distância: <b>%{customdata[0]}</b>m<br>"
+        #     #     + "FC: <b>%{customdata[1]}</b>bpm<br>"
+        #     #     + "Altitude: <b>%{customdata[2]}</b>m<br>"
+        #     #     + "Volta: <b>%{customdata[3]}</b><extra></extra>"
+        #     # ),
+        # )
 
         # Updating layout
         fig.update_layout(
-            height=600,
+            height=650,
+            showlegend=False,
             hovermode="x unified",
+            margin=dict(l=10, r=10, t=50, b=50),
+            title="Análise Ritmo",
             xaxis=dict(
-                title_text="Tempo decorrido (s)", unifiedhovertitle=dict(text="Dados")
+                title_text=f"{xaxis_measure} ({xasis_unit})",
+                unifiedhovertitle=dict(
+                    text=(xaxis_measure + ": <b>%{x}</b>" + xasis_unit)
+                ),
             ),
             yaxis=dict(
                 title_text="Ritmo (min/km)",
                 autorange="reversed",
-                autorangeoptions={"clipmax": 10},
+                autorangeoptions={"minallowed": 0, "clipmax": 12},
+                ticksuffix=":00",
+            ),
+            yaxis2=dict(
+                title="Freq. Card. (bpm) / Altitude (m)",
+                overlaying="y",
+                side="right",
+                showgrid=False,
             ),
         )
 
-        st.write("Análise Ritmo")
-        st.plotly_chart(fig, config={"locale": "pt-BR"})
+        st.plotly_chart(fig, config={"locale": "pt-BR"}, use_container_width=True)
 
         st.write("Dados Voltas")
         st.dataframe(
@@ -227,9 +311,6 @@ if fit_file is not None:
             #     ),
             # },
         )
-
-        st.write("Dados Parciais")
-        st.dataframe(df_split, hide_index=True)
 
         st.write("Dados Brutos")
         st.dataframe(df_record, hide_index=True)
