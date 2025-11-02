@@ -698,7 +698,8 @@ class DataLoaderFromFIT:
 
         Steps performed:
         1. Prepare lap index (`lap`), order by `start_time`, and compute
-        cumulative elapsed time (`cum_elapsed_time`).
+        cumulative elapsed time (`cum_elapsed_time`) and process distance
+        (`cum_distance_processed`).
         2. Merge per-lap aggregates from :meth:`_get_summary_record` (by `"lap"`).
         3. Compute `speed_avg` as per-lap distance divided by per-lap elapsed time.
         4. Convert min/max/avg speed to pace (float and `M:SS`).
@@ -737,6 +738,10 @@ class DataLoaderFromFIT:
             process_lap["distance_processed"] / process_lap["total_elapsed_time"]
         )
 
+        process_lap["cum_distance_processed"] = process_lap[
+            "distance_processed"
+        ].cumsum()
+
         speed_cols = ["speed_min", "speed_max", "speed_avg"]
 
         process_lap = self._transform_speed_to_pace(process_lap, speed_cols)
@@ -749,6 +754,7 @@ class DataLoaderFromFIT:
             "cum_elapsed_time",
             "total_distance",
             "distance_processed",
+            "cum_distance_processed",
             "heart_rate_min",
             "heart_rate_max",
             "heart_rate_mean",
