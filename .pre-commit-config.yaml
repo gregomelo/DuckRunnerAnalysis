@@ -35,7 +35,7 @@ repos:
     rev: v2.0.2
     hooks:
     -   id: autopep8
-        args: ["--max-line-length=88", "--in-place", "--aggressive", "--aggressive"]
+        args: ["--ignore=E203", "--max-line-length=88", "--in-place", "--aggressive", "--aggressive"]
 
 -   repo: https://github.com/PyCQA/pydocstyle
     rev: 6.3.0

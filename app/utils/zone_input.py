@@ -12,8 +12,6 @@ Notes
 - ``ZONE_REF`` stores each zone’s start/end limits (minutes, seconds) and color.
 - ``zone_input_st`` renders dynamic numeric inputs in the Streamlit sidebar,
   maintaining user modifications across interactions through ``st.session_state``.
-- ``pace_minsec_to_float`` converts pace values from minutes/seconds to a float
-  representation in minutes per kilometer.
 """
 
 from __future__ import annotations
@@ -49,32 +47,6 @@ ZONE_REF: Dict[str, ZoneConfig] = {
     "Z4": {"start": {"min": 4, "s": 33}, "end": None, "color": "#FF4500"},
     "Z5": {"start": {"min": 4, "s": 2}, "end": None, "color": "#800080"},
 }
-
-
-def pace_minsec_to_float(mins: int, secs: int) -> float:
-    """
-    Convert a pace value from minutes and seconds into a float representation.
-
-    Parameters
-    ----------
-    mins : int
-        Minutes component of the pace value.
-    secs : int
-        Seconds component of the pace value.
-
-    Returns
-    -------
-    float
-        Pace represented in decimal minutes (e.g., 4 min 30 s → 4.5).
-
-    Examples
-    --------
-    >>> pace_minsec_to_float(5, 30)
-    5.5
-    >>> pace_minsec_to_float(4, 45)
-    4.75
-    """
-    return mins + secs / 60
 
 
 def zone_input_st(
