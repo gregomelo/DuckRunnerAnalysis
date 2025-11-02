@@ -12,13 +12,14 @@ The processing pipeline is:
 2. Build raw DataFrames: `raw_session`, `raw_event`, `raw_lap`, `raw_record`.
 3. Pre-process records at 1 Hz (resampling, interpolation, flags for missing data,
    elapsed time, coordinate conversion from semicircles to degrees).
-4. Optimize smoothing for speed (Savitzky–Golay + centered rolling) via a small
-   grid-search that minimizes a composite loss (fidelity vs. smoothness).
+4. Smooth speed with an adaptive moving-window method that shortens the window
+   on rapid changes and lengthens it in steady segments, followed by a centered
+   rolling average.
 5. Generate processed series (speed components and pace), reconstruct cumulative
    distance from processed speed, and scale to match the device distance.
 6. Map records to laps via time-aware merge-as-of and compute per-lap summaries
    (heart rate, altitude, min/max/avg speeds, per-lap distance).
-7. Produce a tidy `process_lap` table with speeds and their pace equivalents.
+7. Produce a tidy ``process_lap`` table with speeds and their pace equivalents.
 
 Notes
 -----
@@ -27,59 +28,54 @@ Notes
 - Record timestamps are resampled to 1 second; missing values are imputed with
   time-based interpolation (limits differ for "fast" and "slow" signals) and
   forward/backward fill as a safety net.
-- Speed smoothing parameters are selected from a small grid to balance fidelity
-  to the raw signal and second-order smoothness; the chosen params are exposed
-  in ``best_smoothing_params``.
+- Speed smoothing uses an **adaptive moving window**. The window size is adjusted
+  by comparing the current speed to a short recent average:
+  larger windows in steady segments and shorter windows during rapid changes.
+  A centered rolling average is applied afterward to stabilize local noise.
 - Distance reconstruction integrates the processed speed (1 Hz) and scales the
   cumulative total to match the device-reported maximum distance.
 - Laps are associated to records via a backward merge-as-of on
   ``timestamp`` (record) and ``start_time`` (lap). Ensure both sides are sorted.
 
-Main Class
-----------
+API Overview
+------------
 DataLoaderFromFIT
     Orchestrates the end-to-end pipeline from FIT decoding to tabular outputs.
 """
 
-from itertools import product
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Dict, List, Self
+from typing import Any, BinaryIO, Dict, List, Self
 
 import numpy as np
 import pandas as pd
 from garmin_fit_sdk import Decoder, Stream
-from scipy.signal import savgol_filter
 
 from .unit_converter import pace_float_to_time, speed_meters_per_second_to_pace
 
 
 class DataLoaderFromFIT:
     """
-    Decode, transform, and summarize running data from Garmin FIT files.
+    Decode, transform, and summarize running data from FIT files.
 
-    This class orchestrates a complete pipeline for converting a FIT file into
-    structured pandas DataFrames representing sessions, laps, and records. It
-    supports smoothing of speed signals, pace conversion, reconstruction of
-    distance, and computation of per-lap summaries.
+    This class orchestrates a complete pipeline to convert a FIT file into
+    structured pandas DataFrames representing sessions, laps, and records.
+    It applies adaptive smoothing to speed signals, derives pace metrics,
+    reconstructs distance at 1 Hz, and aggregates per-lap statistics.
 
-    The processing sequence is executed by calling :meth:`start`, which performs
-    the following steps in order:
+    The end-to-end processing is triggered by calling :meth:`start`, which
+    executes the steps below in order:
 
-    1. :meth:`extract_message` — decodes the FIT file into message dictionaries.
-    2. :meth:`load_raw_data` — converts message lists into raw DataFrames.
-    3. :meth:`pre_process_record_data` — resamples, imputes, and augments record data.
-    4. :meth:`process_record_data` — optimizes and applies speed smoothing, converts
-       to pace, reconstructs distance, and maps records to laps.
-    5. :meth:`process_lap_data` — aggregates per-lap statistics and finalizes
-       the `process_lap` table.
-
-    The resulting DataFrames are suitable for analytical workflows or visual
-    applications such as Streamlit dashboards.
+    1. :meth:`extract_message` — decode the FIT stream into message dicts.
+    2. :meth:`load_raw_data` — convert message lists into raw DataFrames.
+    3. :meth:`pre_process_record_data` — resample to 1 Hz, impute, augment.
+    4. :meth:`process_record_data` — adaptive speed smoothing, pace, distance,
+       split markers, and lap mapping (:func:`pandas.merge_asof`).
+    5. :meth:`process_lap_data` — per-lap aggregation and pace conversions.
 
     Parameters
     ----------
-    fit_file : str, Path, or BinaryIO
-        Path or binary stream of the FIT file to be processed.
+    fit_file : str, pathlib.Path, or BinaryIO
+        Path or readable binary stream of the FIT file.
 
     Attributes
     ----------
@@ -87,30 +83,52 @@ class DataLoaderFromFIT:
         Parsed FIT messages grouped by type (e.g., ``session_mesgs``,
         ``lap_mesgs``, ``record_mesgs``).
     error : list
-        List of decoding errors reported by the FIT SDK.
-    raw_session, raw_event, raw_lap, raw_record : pandas.DataFrame
-        Untouched DataFrames created from the raw message data.
+        List of decoding issues reported by the FIT SDK (if any).
+    raw_session : pandas.DataFrame
+        Untouched DataFrame built from ``session_mesgs``.
+    raw_event : pandas.DataFrame
+        Untouched DataFrame built from ``event_mesgs``.
+    raw_lap : pandas.DataFrame
+        Untouched DataFrame built from ``lap_mesgs``.
+    raw_record : pandas.DataFrame
+        Untouched DataFrame built from ``record_mesgs``.
     pre_process_record : pandas.DataFrame
-        1 Hz record-level table with interpolated values, flags for missing
-        data, elapsed time, and converted coordinates.
+        Record-level table on a 1 Hz timeline with missing-data flags,
+        elapsed time, and coordinates converted from semicircles to degrees.
     process_record : pandas.DataFrame
-        Smoothed record-level data with pace columns, reconstructed distance,
-        and mapped lap identifiers.
+        Smoothed record-level data with pace fields, reconstructed distance
+        aligned to the device total, split markers, and mapped lap ids.
     process_lap : pandas.DataFrame
-        Per-lap summary table with heart-rate, altitude, and pace statistics.
-    best_smoothing_params : dict or None
-        Optimal Savitzky–Golay and rolling parameters selected during
-        smoothing (keys: ``wl``, ``po``, ``wr``, ``loss``).
+        One row per lap with heart-rate/altitude stats, min/max/avg speeds and
+        their pace representations, cumulative elapsed time, and distances.
 
     Raises
     ------
     IOError
-        If the FIT file cannot be opened or read.
+        If the FIT stream cannot be created from the provided input.
+    TypeError
+        If ``fit_file`` is neither a path-like object nor a readable binary.
     RuntimeError
-        If the decoding process fails unexpectedly.
+        If FIT decoding fails unexpectedly.
     ValueError
-        If the FIT decoder reports an error or if no valid smoothing
-        configuration is found.
+        If the FIT decoder reports structured errors.
+
+    Notes
+    -----
+    - **Coordinates:** semicircles are converted to degrees using
+      ``degrees = semicircles * 180 / 2**31``.
+    - **Resampling & imputation:** records are resampled to 1 s, then
+      interpolated (time-based) with different limits for fast/slow signals,
+      with forward/backward fill as safety net.
+    - **Adaptive smoothing:** speed is smoothed with a moving window that
+      shrinks under rapid changes and widens in steady segments, followed by
+      a centered rolling average for local stabilization. See
+      :meth:`_speed_smoothing` for details.
+    - **Distance reconstruction:** processed speed (1 Hz) is cumulatively
+      integrated and scaled to match the device-reported maximum distance.
+    - **Lap mapping:** records are associated to laps via a backward
+      merge-as-of on record ``timestamp`` and lap ``start_time``; both inputs
+      must be sorted.
 
     Examples
     --------
@@ -130,7 +148,6 @@ class DataLoaderFromFIT:
     raw_record: pd.DataFrame
     pre_process_record: pd.DataFrame
     process_record: pd.DataFrame
-    best_smoothing_params: Dict[str, float | int] | None = None
     process_lap: pd.DataFrame
 
     def __init__(self, fit_file: str | Path | BinaryIO):
@@ -260,29 +277,47 @@ class DataLoaderFromFIT:
 
     def pre_process_record_data(self):
         """
-        Resample, impute, and augment record data to a 1 Hz timeline.
+        Resample, clean, and augment record data to a uniform 1 Hz timeline.
 
-        Operations performed:
-        1. Convert `position_lat/long` from semicircles to degrees.
+        This method performs all preliminary transformations required to create
+        a consistent record-level time series before smoothing and distance
+        reconstruction. It converts coordinates, removes implausible speeds,
+        imputes missing data, and computes auxiliary columns such as flags and
+        elapsed time.
+
+        Steps
+        -----
+        1. Convert latitude/longitude from semicircles to degrees.
         2. Remove duplicate timestamps by averaging rows with the same timestamp.
-        3. Sort by timestamp and resample to 1-second frequency.
-        4. Flag missing values for selected signals.
-        5. Compute `elapsed_time` (seconds from the first record).
-        6. Interpolate missing values (time-based) with different limits for
-        "fast" (`speed`, `power`, coordinates) and "slow" signals
-        (`heart_rate`, `enhanced_altitude`, `enhanced_speed`).
-        7. Forward/backward fill as a final safety net and round/cast types.
+        3. Sort by timestamp and resample at a fixed 1 Hz frequency.
+        4. Apply physical clamps to speed (remove values < 0.5 m/s or > 8.0 m/s).
+        5. Flag missing values for key signals (speed, power, heart rate,
+        altitude).
+        6. Compute ``elapsed_time`` as seconds since the first record.
+        7. Interpolate missing data timewise with different limits:
+        - *Fast* signals: ``speed``, ``power``, ``position_lat``,
+            ``position_long`` (limit = 1 s)
+        - *Slow* signals: ``heart_rate``, ``enhanced_altitude``,
+            ``enhanced_speed`` (limit = 5 s)
+        8. Forward/backward fill as a final safety net and round numeric values.
 
         Populates
         ---------
         pre_process_record : pandas.DataFrame
-            Cleaned, 1 Hz record table with flags and augmented fields.
+            Record-level DataFrame on a 1 Hz timeline, containing:
+            - Interpolated numeric values
+            - Flags for missing data
+            - Elapsed time in seconds
+            - Latitude/longitude in degrees
 
         Notes
         -----
-        - Assumes the FIT timestamps are timezone-aware or consistent; only
-        relative timing is used downstream.
-        - Columns listed for interpolation must exist in the input.
+        - FIT coordinates are stored as 32-bit integers; conversion uses
+        ``degrees = semicircles * 180 / 2**31``.
+        - The resampling step assumes timestamps are consistent and monotonic;
+        only relative timing is required for subsequent computations.
+        - Interpolation uses a time-based method; the `limit` parameter prevents
+        long gaps from being filled unrealistically.
         """
         pre_process_record = self.raw_record.copy()
 
@@ -310,6 +345,12 @@ class DataLoaderFromFIT:
             .asfreq()
             .reset_index()
         )
+
+        # Removing fisic clamps
+        pre_process_record.loc[
+            (pre_process_record["speed"] < 0.5) | (pre_process_record["speed"] > 8.0),
+            "speed",
+        ] = np.nan
 
         # Marking missing points
         pre_process_record["speed_missing"] = pre_process_record["speed"].isna()
@@ -361,98 +402,103 @@ class DataLoaderFromFIT:
 
         self.pre_process_record = pre_process_record
 
-    def _optimize_speed_params(
+    def _speed_smoothing(
         self,
-        speed: pd.Series,
-        alpha: float = 0.7,
-        objective: Callable[[np.ndarray, np.ndarray], float] | None = None,
-    ) -> tuple[dict, np.ndarray]:
+        speed_series,
+        base_window=15,
+        change_threshold=0.3,
+        window_rolling=7,
+    ):
         """
-        Grid-search Savitzky–Golay + rolling parameters to smooth speed.
+        Apply adaptive moving-window smoothing to a speed time series (1 Hz).
 
-        The default objective balances fidelity and smoothness:
-        ``loss = alpha * ||processed - raw||^2 + (1 - alpha) * ||Δ²(processed)||^2``.
+        The algorithm adjusts the local averaging window based on recent speed
+        variation: it shortens the window during rapid changes and lengthens it
+        under steady conditions. After the adaptive pass, a centered rolling
+        mean is applied for local stabilization.
+
+        The *change ratio* is computed against the mean of the last 10 samples.
+        If the ratio exceeds ``change_threshold``, a shorter window is used;
+        otherwise a longer window is used. Finally, a centered rolling window
+        of size ``window_rolling`` is applied to the adaptively smoothed series.
 
         Parameters
         ----------
-        speed : pandas.Series
-            Raw speed sampled at 1 Hz (uniform).
-        alpha : float, default 0.7
-            Weight for fidelity versus smoothness in the composite loss.
-        objective : callable(processed, raw) -> float, optional
-            Custom loss function. If provided, it overrides the default.
+        speed_series : pandas.Series
+            Speed values in m/s on a 1 Hz timeline (index used to preserve time).
+            It is expected to be free of large gaps and NaNs (see
+            :meth:`pre_process_record_data`).
+        base_window : int, default=15
+            Base window length (samples) around which the adaptive window is
+            reduced or expanded.
+        change_threshold : float, default=0.3
+            Relative change threshold (unitless) used to detect rapid variation,
+            computed as ``abs(curr - recent_avg) / recent_avg``.
+        window_rolling : int, default=7
+            Size (samples) of the final centered rolling mean applied after the
+            adaptive pass.
 
         Returns
         -------
-        (params, processed) : (dict, numpy.ndarray)
-            Best hyperparameters (``{'wl','po','wr','loss'}``) and the resulting
-            processed speed series as a NumPy array.
-
-        Raises
-        ------
-        ValueError
-            If no valid (window_length, polyorder, rolling_window) combination is
-            found (e.g., series too short for the chosen grids).
+        pandas.Series
+            Smoothed speed series (m/s), indexed as ``speed_series`` and rounded
+            to three decimals.
 
         Notes
         -----
-        - Candidate grids are small by design for performance.
-        - Assumes uniform 1 Hz sampling (resampled upstream).
+        - **Adaptation window:** recent average uses up to the last 10 samples;
+        adaptation begins after the first 10 points.
+        - **Window bounds:** during rapid changes the window is reduced toward
+        ``max(7, base_window - 8)``; in steady segments it expands toward
+        ``min(25, base_window + 8)``.
+        - **Division by zero:** if the recent average is (near) zero, the change
+        ratio becomes ill-defined; in prática, use desta função assume séries
+        pré-processadas com velocidades > 0 em movimento (paradas prolongadas
+        devem ter sido tratadas no pré-processamento).
+        - **Complexidade:** O(n · w̄), onde w̄ é a janela média resultante da
+        adaptação; adequada para séries de treino típicas (escala de minutos
+        a horas em 1 Hz).
+        - **Pré-requisito:** Recomenda-se chamar
+        :meth:`pre_process_record_data` antes deste método, garantindo série
+        contínua, sem duplicatas e com limites físicos aplicados.
         """
-        wl_grid = (5, 7, 9, 11, 13)
-        po_grid = (2, 3)
-        roll_grid = (5, 7)
+        speeds = speed_series.values
+        smoothed = np.zeros_like(speeds)
+        current_window = base_window
 
-        raw = speed.to_numpy(dtype=float, copy=False)
-        n = raw.size
+        for i in range(len(speeds)):
+            # Detect significant speed changes
+            if i > 10:
+                recent_speeds = speeds[max(0, i - 10) : i]
+                recent_avg = np.mean(recent_speeds)
+                current_speed = speeds[i]
+                change_ratio = abs(current_speed - recent_avg) / recent_avg
 
-        def valid(wl: int, po: int, wr: int) -> bool:
-            # SavGol constraints
-            if wl % 2 == 0 or wl <= po or wl > n:
-                return False
-            return wr >= 1
+                if change_ratio > change_threshold:
+                    # Speed changing rapidly - use shorter window
+                    current_window = max(7, base_window - 8)
+                else:
+                    # Steady state - use longer window
+                    current_window = min(25, base_window + 8)
 
-        best_loss = np.inf
-        best_processed = None
-        best_params = {}
+            # Apply smoothing with current window
+            start_idx = max(0, i - current_window // 2)
+            end_idx = min(len(speeds), i + current_window // 2 + 1)
 
-        for wl, po, wr in product(wl_grid, po_grid, roll_grid):
-            if not valid(wl, po, wr):
-                continue
-
-            # Savitzky–Golay; assumes uniform sampling (you already resampled to 1s)
-            sg = savgol_filter(raw, window_length=wl, polyorder=po, mode="interp")
-
-            # Centered rolling mean
-            roll = (
-                pd.Series(raw)
-                .rolling(window=wr, center=True, min_periods=1)
-                .mean()
-                .to_numpy()
-            )
-
-            processed = 0.7 * sg + 0.3 * roll
-
-            if objective is not None:
-                loss = objective(processed, raw)
+            if end_idx - start_idx > 0:
+                smoothed[i] = np.mean(speeds[start_idx:end_idx])
             else:
-                resid = processed - raw
-                fidelity = float(np.dot(resid, resid))
-                rough = np.diff(processed, n=2)
-                smoothness = float(np.dot(rough, rough))
-                loss = alpha * fidelity + (1.0 - alpha) * smoothness
+                smoothed[i] = speeds[i]
 
-            if loss < best_loss:
-                best_loss = loss
-                best_processed = processed
-                best_params = {"wl": wl, "po": po, "wr": wr, "loss": loss}
+        smoothed_serie = pd.Series(smoothed, index=speed_series.index)
 
-        if best_processed is None:
-            raise ValueError(
-                "No valid (wl, po, wr) combination found for given series."
-            )
+        smoothed_serie_rolling = (
+            smoothed_serie.rolling(window=window_rolling, center=True, min_periods=1)
+            .mean()
+            .round(3)
+        )
 
-        return best_params, best_processed
+        return smoothed_serie_rolling
 
     def _transform_speed_to_pace(
         self, dataframe: pd.DataFrame, cols_to_transform: List[str]
@@ -502,55 +548,67 @@ class DataLoaderFromFIT:
 
     def process_record_data(self) -> None:
         """
-        Apply smoothing to speed, convert to pace, and reconstruct distance.
+        Pipeline to process record data from FIT files.
 
-        Steps performed:
-        1. Select optimal smoothing parameters via :meth:`_optimize_speed_params`.
-        2. Compute `speed_sav_gol`, `speed_rolling`, and `speed_processed`.
-        3. Convert speed columns to pace (float and `M:SS`).
-        4. Reconstruct `distance_processed` by cumulative sum of processed speed
-        (1 Hz) and scale to match the device maximum distance.
-        5. Compute `split` (integer) from `distance_processed` (every 1 km).
-        6. Associate records with laps via a backward merge-as-of between record
-        `timestamp` and lap `start_time`.
+        Apply adaptive speed smoothing, derive pace, reconstruct distance,
+        generate splits, and map records to laps.
+
+        Steps
+        -----
+        1. Smooth speed with :meth:`_speed_smoothing` → ``speed_processed``.
+        2. Derive pace (float and ``M:SS``) for ``["speed", "speed_processed"]``.
+        3. Reconstruct cumulative ``distance_processed`` at 1 Hz by cumulative
+        sum of ``speed_processed`` and **scale** to match the device distance
+        (``raw_record["distance"].max()``).
+        4. Compute integer ``split`` (1 km buckets) from ``distance_processed``.
+        5. Map records to laps using a backward ``merge_asof`` of record
+        ``timestamp`` to lap ``start_time`` (sorted on both sides), attaching
+        the lap index (``lap``).
 
         Populates
         ---------
         process_record : pandas.DataFrame
-            Record-level table with smoothed speeds, pace fields, processed
-            distance, split markers, and lap identifiers.
+            Record-level table with the following (in adição às colunas de entrada):
+            - ``speed_processed`` : float
+            - ``pace`` / ``pace_time`` for each speed col (e.g. ``pace_time`` for
+            ``speed`` and ``speed_processed``)
+            - ``distance_processed`` : float (meters, scaled to device total)
+            - ``split`` : int (1, 2, 3, …) per every 1000 m
+            - ``lap`` : int (1-based), from merge-as-of with lap ``start_time``
 
         Notes
         -----
-        - Requires `pre_process_record` and `raw_lap` to be available.
-        - Both records and laps are sorted before the merge-as-of step.
+        - **Units:** speed in m/s; pace in min/km; distance in meters.
+        - **Scaling:** the scale factor is
+        ``device_max = distance.max(); scale = device_max / distance_processed.max()``.
+        This assumes that ``distance`` exists and that
+        ``distance_processed.max() > 0``.
+        - **Sorting:** both records and laps are sorted by their time columns prior
+        to ``merge_asof``; the merge uses ``direction="backward"``.
+        - **Splits:** computed as
+        ``1 + floor(distance_processed / 1000)`` with dtype ``int``.
+
+        Raises
+        ------
+        KeyError
+            If required columns are missing in ``pre_process_record`` (e.g.,
+            ``"timestamp"``, ``"speed"``, ``"distance"``) or in ``raw_lap``
+            (e.g., ``"start_time"``).
+        ValueError
+            If ``distance_processed.max()`` equals zero, scaling would be
+            undefined; ensure the speed series is non-empty and positive after
+            preprocessing.
         """
         process_record = self.pre_process_record.copy()
         raw_lap = self.raw_lap.copy()
 
-        # Applying smooth tunning
-        params, processed = self._optimize_speed_params(process_record["speed"])
-        self.best_smoothing_params = params
-
-        # Recompute individual components for transparency using best params
-        wl, po, wr = params["wl"], params["po"], params["wr"]
-
-        process_record["speed_sav_gol"] = savgol_filter(
-            process_record["speed"].to_numpy(dtype=float, copy=False),
-            window_length=wl,
-            polyorder=po,
-            mode="interp",
-        )
-        process_record["speed_rolling"] = (
+        # Smoothing speed
+        process_record["speed_processed"] = self._speed_smoothing(
             process_record["speed"]
-            .rolling(window=wr, center=True, min_periods=1)
-            .mean()
-            .to_numpy()
         )
-        process_record["speed_processed"] = processed
 
-        speed_cols = ["speed_sav_gol", "speed_rolling", "speed_processed"]
-
+        # Creting pace columns based on speed
+        speed_cols = ["speed", "speed_processed"]
         process_record = self._transform_speed_to_pace(process_record, speed_cols)
 
         # Distance from processed speed (scale to match device max distance)
